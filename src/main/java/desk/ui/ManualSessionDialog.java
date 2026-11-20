@@ -45,6 +45,7 @@ final class ManualSessionDialog {
         grid.addRow(2, new Label("Duración (min)"), minutes);
         grid.add(error, 0, 3, 2, 1);
         dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getStyleClass().add("desk-dialog");
 
         dialog.getDialogPane().lookupButton(ButtonType.OK).addEventFilter(javafx.event.ActionEvent.ACTION, ev -> {
             try {

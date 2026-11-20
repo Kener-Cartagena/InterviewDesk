@@ -16,9 +16,9 @@ public record VideoSession(
 
     public static final String MANUAL_PREFIX = "manual:";
 
-    /** Horas pagadas: el valor manual si existe, si no la regla automática. */
+    /** Horas exactas de la reunión, sin redondeo. */
     public double paidHours() {
-        return durationSeconds / 3600.0;
+        return Billing.hours(durationSeconds);
     }
 
     public boolean manual() {

@@ -1,18 +1,22 @@
 package desk.ui;
 
 import desk.db.Repository;
+import desk.model.Billing;
 import desk.model.VideoSession;
 import desk.service.Config;
 import javafx.application.Platform;
 import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.beans.property.ReadOnlyStringWrapper;
 import javafx.beans.property.SimpleBooleanProperty;
-import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.control.Button;
+import javafx.scene.control.ContentDisplay;
 import javafx.scene.control.DatePicker;
 import javafx.scene.control.Label;
+import javafx.scene.control.ProgressBar;
 import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableRow;
 import javafx.scene.control.TableView;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
@@ -20,6 +24,7 @@ import javafx.scene.control.cell.CheckBoxTableCell;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 
 import java.time.DayOfWeek;
@@ -38,12 +43,14 @@ import java.util.TreeMap;
 /**
  * Horas por día y por empresa en un día, una semana o un periodo de pago (2 semanas).
  * El periodo siempre es el que contiene la fecha elegida arriba.
+ * El tiempo se cuenta exacto, sin redondeo: el dinero sale de los segundos reales.
  */
 public final class HoursView extends VBox {
     private static final Locale ES = Locale.forLanguageTag("es");
-    private static final DateTimeFormatter LONG = DateTimeFormatter.ofPattern("EEEE d MMM yyyy", ES);
+    private static final DateTimeFormatter LONG = DateTimeFormatter.ofPattern("EEEE d 'de' MMMM yyyy", ES);
+    private static final DateTimeFormatter MEDIUM = DateTimeFormatter.ofPattern("EEEE d MMM", ES);
+    private static final DateTimeFormatter SHORT = DateTimeFormatter.ofPattern("EEE d MMM", ES);
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm");
-    private static final double HOURLY_RATE = 15.0; // Tarifa fija por hora a pagar
 
     private enum Mode {
         DAY("Día", 1), WEEK("Semana", 7), TWO_WEEKS("2 semanas", 14);
@@ -61,52 +68,66 @@ public final class HoursView extends VBox {
         final LocalDate date;
         final int count;
         final int seconds;
-        final double hours;
         final BooleanProperty paid;
 
-        DayRow(LocalDate date, int count, int seconds, double hours, boolean paid) {
+        DayRow(LocalDate date, int count, int seconds, boolean paid) {
             this.date = date;
             this.count = count;
             this.seconds = seconds;
-            this.hours = hours;
             this.paid = new SimpleBooleanProperty(paid);
         }
     }
 
-    private record CompanyRow(String name, int count, int seconds, double hours) {}
+    private record CompanyRow(String name, int count, int seconds) {}
 
     private final Repository repo;
     private Mode mode = Mode.TWO_WEEKS;
     private LocalDate cursor = LocalDate.now();
+    private LocalDate dayFilter;
     private boolean syncing;
     private Map<LocalDate, List<VideoSession>> grouped = new TreeMap<>();
-    private List<VideoSession> currentPeriodSessions = new ArrayList<>();
+    private List<VideoSession> periodSessions = new ArrayList<>();
 
     private final DatePicker picker = new DatePicker(LocalDate.now());
+    private final Label pageTitle = new Label("Horas y pagos");
     private final Label rangeLabel = new Label();
-    private final Label totalHours = new Label("0 h ($0.00)");
-    private final Label rawTotalHours = new Label("—"); // Tarjeta independiente para el tiempo real en bruto
-    private final Label paidHours = new Label("0 h ($0.00)");
-    private final Label pendingHours = new Label("0 h ($0.00)");
+
+    private final Label totalMoney = new Label();
+    private final Label totalSub = new Label();
+    private final Label workedTime = new Label();
+    private final Label workedSub = new Label();
+    private final Label paidMoney = new Label();
+    private final Label paidSub = new Label();
+    private final Label pendingMoney = new Label();
+    private final Label pendingSub = new Label();
+    private final ProgressBar paidProgress = new ProgressBar(0);
+    private final Label paidPercent = new Label();
+
     private final Button payAll = new Button();
     private final TableView<DayRow> dayTable = new TableView<>();
     private final TableView<VideoSession> detailTable = new TableView<>();
     private final TableView<CompanyRow> companyTable = new TableView<>();
+    private final Label detailTitle = new Label("Reuniones");
+    private final Label detailCount = Ui.badge("0", "muted");
+    private final Label dayCount = Ui.badge("0", "muted");
+    private final Label companyCount = Ui.badge("0", "muted");
+    private final Button clearFilter = Ui.button("Ver todas", Ui.I_CALENDAR, "ghost", "small");
+    private ToggleButton dayTab;
+    private ToggleButton meetingsTab;
 
     public HoursView(Repository repo) {
         this.repo = repo;
-        setSpacing(14);
-        setPadding(new Insets(18, 0, 0, 0));
+        setSpacing(18);
+        getStyleClass().add("page");
 
-        // --- selector de periodo y fecha ---
+        // --- encabezado: título, navegación de fechas y selector de periodo ---
         ToggleGroup group = new ToggleGroup();
-        HBox modes = new HBox(6);
+        HBox modes = segmented(group, Mode.values().length);
         for (Mode m : Mode.values()) {
-            ToggleButton b = new ToggleButton(m.label);
-            b.setToggleGroup(group);
+            ToggleButton b = (ToggleButton) modes.getChildren().get(m.ordinal());
+            b.setText(m.label);
             b.setUserData(m);
             b.setSelected(m == mode);
-            modes.getChildren().add(b);
         }
         group.selectedToggleProperty().addListener((o, previous, selected) -> {
             if (selected == null) {
@@ -114,145 +135,237 @@ public final class HoursView extends VBox {
                 return;
             }
             mode = (Mode) selected.getUserData();
+            dayFilter = null;
             apply();
         });
 
-        Button prev = new Button("‹");
+        Button prev = Ui.iconButton(Ui.I_LEFT, "Periodo anterior");
         prev.setOnAction(e -> shift(-1));
-        Button next = new Button("›");
+        Button next = Ui.iconButton(Ui.I_RIGHT, "Periodo siguiente");
         next.setOnAction(e -> shift(1));
-        Button today = new Button("Hoy");
+        Button today = Ui.button("Hoy", Ui.I_CALENDAR);
         today.setOnAction(e -> {
             cursor = LocalDate.now();
+            dayFilter = null;
             apply();
         });
         picker.setPrefWidth(150);
         picker.valueProperty().addListener((o, was, date) -> {
             if (!syncing && date != null) {
                 cursor = date;
+                dayFilter = null;
                 apply();
             }
         });
+        HBox dateNav = Ui.row(6, prev, picker, next, today);
+        HBox header = Ui.pageHeader(pageTitle, rangeLabel, dateNav, modes);
 
-        payAll.getStyleClass().add("primary");
+        // --- tarjetas de totales ---
+        paidProgress.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(paidProgress, Priority.ALWAYS);
+        paidPercent.getStyleClass().add("kpi-foot");
+        HBox progressRow = Ui.row(10, paidProgress, paidPercent);
+
+        VBox hero = kpi(Ui.I_MONEY, "Total del periodo", totalMoney, totalSub, "hero");
+        hero.getChildren().add(progressRow);
+        hero.setPrefWidth(340);
+
         payAll.setOnAction(e -> togglePayAll());
-        Region grow = new Region();
-        HBox.setHgrow(grow, Priority.ALWAYS);
-        HBox top = new HBox(10, modes, prev, picker, next, today, grow, payAll);
-        top.setAlignment(Pos.CENTER_LEFT);
+        payAll.getStyleClass().add("small");
+        payAll.setMinWidth(Region.USE_PREF_SIZE);
+        VBox pendingCard = kpi(Ui.I_CLOCK, "Pendiente de pago", pendingMoney, pendingSub, "warn");
+        HBox pendingFoot = Ui.row(8, pendingSub, Ui.grow(), payAll);
+        pendingCard.getChildren().add(pendingFoot);
 
-        rangeLabel.getStyleClass().add("range");
+        HBox cards = new HBox(16,
+                hero,
+                kpi(Ui.I_CLOCK, "Tiempo trabajado", workedTime, workedSub, "info"),
+                kpi(Ui.I_CHECK_CIRCLE, "Pagado", paidMoney, paidSub, "ok"),
+                pendingCard);
+        pendingCard.setPrefWidth(320);
 
-        // --- totales (tarjetas independientes) ---
-        pendingHours.getStyleClass().add("stat-pending");
-        HBox cards = new HBox(14,
-                card("Total del periodo", totalHours),
-                card("Tiempo real (Bruto)", rawTotalHours),
-                card("Pagadas", paidHours),
-                card("Pendientes de pago", pendingHours));
-
-        // --- tablas ---
+        // --- tablas: una tarjeta con pestañas "Por día" / "Reuniones" + tarjeta por empresa ---
         buildDayTable();
         buildDetailTable();
         buildCompanyTable();
-        dayTable.setPrefHeight(220);
-        dayTable.setMinHeight(120);
-        
-        VBox left = new VBox(8, caption("Por día"), dayTable,
-                caption(getDetailCaptionText()), detailTable);
-        VBox.setVgrow(detailTable, Priority.ALWAYS);
-        VBox right = new VBox(8, caption("Por empresa (total del periodo)"), companyTable);
-        VBox.setVgrow(companyTable, Priority.ALWAYS);
-        HBox tables = new HBox(16, left, right);
-        HBox.setHgrow(left, Priority.ALWAYS);
-        HBox.setHgrow(right, Priority.ALWAYS);
-        left.setPrefWidth(620);
-        right.setPrefWidth(380);
-        VBox.setVgrow(tables, Priority.ALWAYS);
 
-        dayTable.getSelectionModel().selectedItemProperty().addListener((o, was, row) -> {
-            if (mode == Mode.DAY) {
-                List<VideoSession> meetings = new ArrayList<>();
-                if (row != null) meetings.addAll(grouped.getOrDefault(row.date, List.of()));
-                meetings.sort(Comparator.comparing(VideoSession::recordedAt));
-                detailTable.getItems().setAll(meetings);
-            }
+        clearFilter.setOnAction(e -> {
+            dayFilter = null;
+            showDetail();
         });
 
-        getChildren().addAll(top, rangeLabel, cards, tables);
+        ToggleGroup views = new ToggleGroup();
+        HBox viewSwitch = segmented(views, 2);
+        dayTab = (ToggleButton) viewSwitch.getChildren().get(0);
+        meetingsTab = (ToggleButton) viewSwitch.getChildren().get(1);
+        dayTab.setText("Por día");
+        dayTab.setGraphic(dayCount);
+        meetingsTab.setText("Reuniones");
+        meetingsTab.setGraphic(detailCount);
+        for (ToggleButton t : List.of(dayTab, meetingsTab)) {
+            t.setContentDisplay(ContentDisplay.RIGHT);
+            t.setGraphicTextGap(8);
+        }
+        views.selectedToggleProperty().addListener((o, previous, selected) -> {
+            if (selected == null) {
+                previous.setSelected(true);
+                return;
+            }
+            boolean days = selected == dayTab;
+            dayTable.setVisible(days);
+            detailTable.setVisible(!days);
+            showDetail();
+        });
+        dayTab.setSelected(true);
+        detailTable.setVisible(false);
+
+        StackPane tableStack = new StackPane(dayTable, detailTable);
+        detailTitle.getStyleClass().add("hint");
+        HBox tabsHeader = Ui.row(12, viewSwitch, detailTitle, Ui.grow(), clearFilter);
+        VBox mainCard = new VBox(12, tabsHeader, tableStack);
+        mainCard.getStyleClass().add("card");
+        VBox.setVgrow(tableStack, Priority.ALWAYS);
+        VBox companyCard = Ui.section(Ui.I_WORK, "Por empresa", companyTable, companyCount);
+
+        HBox tables = new HBox(16, mainCard, companyCard);
+        HBox.setHgrow(mainCard, Priority.ALWAYS);
+        HBox.setHgrow(companyCard, Priority.SOMETIMES);
+        mainCard.setPrefWidth(760);
+        companyCard.setPrefWidth(430);
+        companyCard.setMinWidth(350);
+        VBox.setVgrow(tables, Priority.ALWAYS);
+
+        // Doble clic en un día: muestra solo sus reuniones.
+        dayTable.setRowFactory(tv -> {
+            TableRow<DayRow> row = new TableRow<>();
+            row.setOnMouseClicked(e -> {
+                if (!row.isEmpty() && e.getClickCount() == 2) {
+                    dayFilter = row.getItem().date;
+                    meetingsTab.setSelected(true);
+                    showDetail();
+                }
+            });
+            return row;
+        });
+
+        getChildren().addAll(header, cards, tables);
     }
 
-    private String getDetailCaptionText() {
-        return mode == Mode.DAY ? "Reuniones del día seleccionado" : "Reuniones del periodo completo";
+    /** Grupo de botones pegados, tipo pestañas. */
+    private static HBox segmented(ToggleGroup group, int n) {
+        HBox box = new HBox();
+        box.getStyleClass().add("segmented");
+        box.setMaxHeight(Region.USE_PREF_SIZE);
+        box.setMinWidth(Region.USE_PREF_SIZE);
+        box.setAlignment(Pos.CENTER_LEFT);
+        for (int i = 0; i < n; i++) {
+            ToggleButton b = new ToggleButton();
+            b.setToggleGroup(group);
+            b.getStyleClass().add("segment");
+            b.setMinWidth(Region.USE_PREF_SIZE);
+            box.getChildren().add(b);
+        }
+        return box;
     }
 
     // ---------- construcción ----------
 
-    private static Label caption(String text) {
-        Label label = new Label(text);
-        label.getStyleClass().add("caption");
-        return label;
-    }
-
-    private static VBox card(String caption, Label value) {
-        value.getStyleClass().add("stat");
-        VBox box = new VBox(4, caption(caption), value);
-        box.getStyleClass().add("card");
-        box.setMinWidth(200);
+    private static VBox kpi(String svg, String caption, Label value, Label sub, String tone) {
+        value.getStyleClass().add("kpi-value");
+        sub.getStyleClass().add("kpi-sub");
+        HBox top = Ui.row(10, Ui.iconBubble(svg), Ui.label(caption, "kpi-caption"));
+        VBox box = new VBox(8, top, value, sub);
+        box.getStyleClass().addAll("kpi", "kpi-" + tone);
+        box.setMinWidth(190);
+        box.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(box, Priority.ALWAYS);
         return box;
     }
 
     private void buildDayTable() {
         TableColumn<DayRow, String> date = new TableColumn<>("Fecha");
-        date.setCellValueFactory(d -> new ReadOnlyStringWrapper(capitalize(d.getValue().date.format(LONG))));
-        date.setMinWidth(190);
+        date.setCellValueFactory(d -> new ReadOnlyStringWrapper(capitalize(d.getValue().date.format(MEDIUM))));
+        date.setMinWidth(140);
         TableColumn<DayRow, String> count = new TableColumn<>("Reuniones");
         count.setCellValueFactory(d -> new ReadOnlyStringWrapper(String.valueOf(d.getValue().count)));
-        TableColumn<DayRow, String> real = new TableColumn<>("Tiempo real");
+        count.getStyleClass().add("align-center");
+        TableColumn<DayRow, String> real = new TableColumn<>("Tiempo");
         real.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.duration(d.getValue().seconds)));
-        
-        // Columna "Horas a pagar" eliminada de aquí por solicitud
+        TableColumn<DayRow, String> money = new TableColumn<>("Monto");
+        money.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.money(d.getValue().seconds)));
+        money.getStyleClass().add("money-col");
 
         TableColumn<DayRow, Boolean> paid = new TableColumn<>("Pagado");
         paid.setCellValueFactory(d -> d.getValue().paid);
         paid.setCellFactory(CheckBoxTableCell.forTableColumn(paid));
         paid.setEditable(true);
-        
-        dayTable.getColumns().addAll(date, count, real, paid);
+        paid.getStyleClass().add("align-center");
+
+        date.setPrefWidth(180);
+        count.setPrefWidth(95);
+        count.setMinWidth(85);
+        real.setPrefWidth(140);
+        real.setMinWidth(125);
+        money.setPrefWidth(100);
+        money.setMinWidth(80);
+        paid.setPrefWidth(85);
+        paid.setMinWidth(75);
+        dayTable.getColumns().addAll(List.of(date, count, real, money, paid));
         dayTable.setEditable(true);
-        dayTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
-        dayTable.setPlaceholder(new Label("No hay reuniones en este periodo."));
+        dayTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+        dayTable.setPlaceholder(Ui.tablePlaceholder("No hay reuniones en este periodo."));
     }
 
     private void buildDetailTable() {
         TableColumn<VideoSession, String> dateCol = new TableColumn<>("Fecha");
-        dateCol.setCellValueFactory(d -> new ReadOnlyStringWrapper(d.getValue().recordedAt().toLocalDate().format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))));
+        dateCol.setCellValueFactory(d -> new ReadOnlyStringWrapper(capitalize(d.getValue().recordedAt().format(SHORT))));
         TableColumn<VideoSession, String> time = new TableColumn<>("Hora");
         time.setCellValueFactory(d -> new ReadOnlyStringWrapper(d.getValue().recordedAt().format(TIME)));
         TableColumn<VideoSession, String> company = new TableColumn<>("Empresa");
         company.setCellValueFactory(d -> new ReadOnlyStringWrapper(d.getValue().companyName()));
-        TableColumn<VideoSession, String> file = new TableColumn<>("Video");
-        file.setCellValueFactory(d -> new ReadOnlyStringWrapper(d.getValue().fileName()));
         TableColumn<VideoSession, String> length = new TableColumn<>("Duración");
         length.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.duration(d.getValue().durationSeconds())));
-        
-        // Columna "Horas" eliminada de aquí por solicitud
-
-        detailTable.getColumns().addAll(dateCol, time, company, file, length);
-        detailTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
-        detailTable.setPlaceholder(new Label("No hay reuniones para mostrar."));
+        TableColumn<VideoSession, String> money = new TableColumn<>("Monto");
+        money.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.money(d.getValue().durationSeconds())));
+        money.getStyleClass().add("money-col");
+        TableColumn<VideoSession, Boolean> state = new TableColumn<>("Estado");
+        state.setCellValueFactory(d -> new ReadOnlyObjectWrapper<>(d.getValue().paid()));
+        state.setCellFactory(c -> Cells.paidBadge());
+        dateCol.setPrefWidth(110);
+        dateCol.setMinWidth(100);
+        time.setPrefWidth(65);
+        time.setMinWidth(58);
+        company.setPrefWidth(170);
+        company.setMinWidth(110);
+        length.setPrefWidth(120);
+        length.setMinWidth(110);
+        money.setPrefWidth(80);
+        money.setMinWidth(72);
+        state.setPrefWidth(105);
+        state.setMinWidth(100);
+        detailTable.getColumns().addAll(List.of(dateCol, time, company, length, money, state));
+        detailTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+        detailTable.setPlaceholder(Ui.tablePlaceholder("No hay reuniones para mostrar."));
     }
 
     private void buildCompanyTable() {
         TableColumn<CompanyRow, String> name = new TableColumn<>("Empresa");
         name.setCellValueFactory(d -> new ReadOnlyStringWrapper(d.getValue().name()));
-        TableColumn<CompanyRow, String> count = new TableColumn<>("Reuniones");
-        count.setCellValueFactory(d -> new ReadOnlyStringWrapper(String.valueOf(d.getValue().count())));
-        TableColumn<CompanyRow, String> hours = new TableColumn<>("Horas");
-        hours.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.hours(d.getValue().hours())));
-        companyTable.getColumns().addAll(name, count, hours);
-        companyTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
-        companyTable.setPlaceholder(new Label("No hay reuniones en este periodo."));
+        name.setCellFactory(c -> Cells.company());
+        TableColumn<CompanyRow, String> time = new TableColumn<>("Tiempo");
+        time.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.duration(d.getValue().seconds())));
+        TableColumn<CompanyRow, String> money = new TableColumn<>("Monto");
+        money.setCellValueFactory(d -> new ReadOnlyStringWrapper(Fmt.money(d.getValue().seconds())));
+        money.getStyleClass().add("money-col");
+        name.setPrefWidth(170);
+        name.setMinWidth(110);
+        time.setPrefWidth(125);
+        time.setMinWidth(115);
+        money.setPrefWidth(80);
+        money.setMinWidth(72);
+        companyTable.getColumns().addAll(List.of(name, time, money));
+        companyTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+        companyTable.setPlaceholder(Ui.tablePlaceholder("No hay reuniones en este periodo."));
     }
 
     private static String capitalize(String s) {
@@ -288,6 +401,7 @@ public final class HoursView extends VBox {
 
     private void shift(int direction) {
         cursor = cursor.plusDays((long) direction * mode.days);
+        dayFilter = null;
         apply();
     }
 
@@ -311,25 +425,31 @@ public final class HoursView extends VBox {
         syncing = true;
         picker.setValue(cursor);
         syncing = false;
+
+        pageTitle.setText(switch (mode) {
+            case DAY -> "Horas del día";
+            case WEEK -> "Horas de la semana";
+            case TWO_WEEKS -> "Periodo de pago";
+        });
         rangeLabel.setText(mode == Mode.DAY
                 ? capitalize(r[0].format(LONG))
-                : "Del " + r[0].format(LONG) + " al " + last.format(LONG));
+                : capitalize(r[0].format(MEDIUM)) + "  →  " + last.format(LONG));
 
         List<VideoSession> rows = repo.sessionsBetween(r[0], r[1]);
-        currentPeriodSessions = rows;
+        periodSessions = rows;
 
         Map<LocalDate, List<VideoSession>> byDay = new TreeMap<>(Comparator.reverseOrder());
         Map<String, List<VideoSession>> byCompany = new LinkedHashMap<>();
-        
-        double paid = 0;
-        int rawTotalSeconds = 0;
+        long totalSeconds = 0;
+        long paidSeconds = 0;
 
         for (VideoSession s : rows) {
             byDay.computeIfAbsent(s.recordedAt().toLocalDate(), d -> new ArrayList<>()).add(s);
             byCompany.computeIfAbsent(s.companyName(), n -> new ArrayList<>()).add(s);
-            rawTotalSeconds += s.durationSeconds(); // Acumula el tiempo real en bruto
-            if (s.paid()) paid += s.paidHours();
+            totalSeconds += s.durationSeconds();
+            if (s.paid()) paidSeconds += s.durationSeconds();
         }
+        long pendingSeconds = totalSeconds - paidSeconds;
         grouped = byDay;
 
         List<DayRow> dayRows = new ArrayList<>();
@@ -339,7 +459,6 @@ public final class HoursView extends VBox {
                     e.getKey(),
                     list.size(),
                     list.stream().mapToInt(VideoSession::durationSeconds).sum(),
-                    list.stream().mapToDouble(VideoSession::paidHours).sum(),
                     list.stream().allMatch(VideoSession::paid));
             row.paid.addListener((o, was, isPaid) -> {
                 repo.setPaidBetween(row.date, row.date.plusDays(1), isPaid);
@@ -351,57 +470,74 @@ public final class HoursView extends VBox {
         List<CompanyRow> companyRows = new ArrayList<>();
         for (Map.Entry<String, List<VideoSession>> e : byCompany.entrySet()) {
             List<VideoSession> list = e.getValue();
-            companyRows.add(new CompanyRow(
-                    e.getKey(),
-                    list.size(),
-                    list.stream().mapToInt(VideoSession::durationSeconds).sum(),
-                    list.stream().mapToDouble(VideoSession::paidHours).sum()));
+            companyRows.add(new CompanyRow(e.getKey(), list.size(),
+                    list.stream().mapToInt(VideoSession::durationSeconds).sum()));
         }
-        companyRows.sort(Comparator.comparingDouble(CompanyRow::hours).reversed());
+        companyRows.sort(Comparator.comparingInt(CompanyRow::seconds).reversed());
 
         dayTable.getItems().setAll(dayRows);
         companyTable.getItems().setAll(companyRows);
+        dayCount.setText(String.valueOf(dayRows.size()));
+        companyCount.setText(String.valueOf(companyRows.size()));
 
-        if (mode == Mode.DAY) {
-            DayRow selected = dayTable.getSelectionModel().getSelectedItem();
-            LocalDate keep = selected == null ? null : selected.date;
-            if (!dayRows.isEmpty()) {
-                DayRow pick = dayRows.stream().filter(d -> d.date.equals(keep)).findFirst().orElse(dayRows.get(0));
-                dayTable.getSelectionModel().select(pick);
-            } else {
-                detailTable.getItems().clear();
-            }
-        } else {
-            List<VideoSession> allPeriodMeetings = new ArrayList<>(rows);
-            allPeriodMeetings.sort(Comparator.comparing(VideoSession::recordedAt));
-            detailTable.getItems().setAll(allPeriodMeetings);
-        }
+        boolean dayMode = mode == Mode.DAY;
+        dayTab.setVisible(!dayMode);
+        dayTab.setManaged(!dayMode);
+        if (dayMode) meetingsTab.setSelected(true);
 
-        // 1. Aplicamos la regla de 15 en 15 sobre el total de segundos en bruto del periodo
-        double totalBillableHours = Fmt.calculateBillableHours(rawTotalSeconds);
-        double totalMoney = totalBillableHours * HOURLY_RATE;
+        if (dayFilter != null && !byDay.containsKey(dayFilter)) dayFilter = null;
+        showDetail();
 
-        // 2. Verificamos si todo el periodo está pagado (revisando si las sesiones están pagadas)
-        boolean allPaid = rows.stream().allMatch(VideoSession::paid) && !rows.isEmpty();
+        // --- totales: tiempo exacto, sin redondeo ---
+        int meetings = rows.size();
+        totalMoney.setText(Fmt.money(totalSeconds));
+        totalSub.setText(Fmt.durationOrZero(totalSeconds) + "  ·  " + Fmt.count(meetings, "reunión", "reuniones"));
+        // En grande horas y minutos; los segundos sueltos van justo debajo para que quepa.
+        long extraSeconds = totalSeconds % 60;
+        workedTime.setText(totalSeconds < 60 ? Fmt.durationOrZero(totalSeconds) : Fmt.duration(totalSeconds - extraSeconds));
+        workedSub.setText((totalSeconds >= 60 && extraSeconds > 0 ? "y " + extraSeconds + " s  ·  " : "Exacto  ·  ")
+                + String.format(Locale.US, "$%.0f por hora", Billing.HOURLY_RATE));
+        paidMoney.setText(Fmt.money(paidSeconds));
+        paidSub.setText(Fmt.durationOrZero(paidSeconds));
+        pendingMoney.setText(Fmt.money(pendingSeconds));
+        pendingSub.setText(Fmt.durationOrZero(pendingSeconds));
 
-        // 3. Si está pagado: 'Pagadas' muestra el total calculado y su dinero. 'Pendientes' muestra $0.00.
-        //    Si NO está pagado: 'Pagadas' muestra 0 h ($0.00) y 'Pendientes' muestra el total cobrable.
-        double paidHoursVal = allPaid ? totalBillableHours : 0.0;
-        double paidMoney = allPaid ? totalMoney : 0.0;
+        double ratio = totalSeconds == 0 ? 0 : (double) paidSeconds / totalSeconds;
+        paidProgress.setProgress(ratio);
+        paidPercent.setText(totalSeconds == 0 ? "Sin reuniones" : Math.round(ratio * 100) + "% pagado");
 
-        double pendingHoursVal = allPaid ? 0.0 : totalBillableHours;
-        double pendingMoney = allPaid ? 0.0 : totalMoney;
-
-        // Actualizamos las tarjetas principales limpiamente
-        totalHours.setText(String.format("%s ($%.2f)", Fmt.hours(totalBillableHours), totalMoney));
-        rawTotalHours.setText(Fmt.rawDuration(rawTotalSeconds)); // Tiempo real intacto en su tarjeta al lado
-        
-        paidHours.setText(String.format("%s ($%.2f)", Fmt.hours(paidHoursVal), paidMoney));
-        pendingHours.setText(String.format("%s ($%.2f)", Fmt.hours(pendingHoursVal), pendingMoney));
-
-        boolean pending = pendingMoney > 0;
+        boolean pending = pendingSeconds > 0;
         payAll.setUserData(pending);
-        payAll.setText(pending ? "Marcar todo como pagado" : "Quitar pagos del periodo");
+        payAll.setText(pending ? "Marcar pagado" : "Quitar pagos");
+        payAll.setTooltip(new javafx.scene.control.Tooltip(pending
+                ? "Marca todas las reuniones de este periodo como pagadas"
+                : "Vuelve a dejar pendientes las reuniones de este periodo"));
+        payAll.setGraphic(Ui.icon(pending ? Ui.I_CHECK : Ui.I_DELETE, 16));
+        payAll.setGraphicTextGap(8);
+        payAll.getStyleClass().removeAll("primary", "ghost");
+        payAll.getStyleClass().add(pending ? "primary" : "ghost");
         payAll.setDisable(rows.isEmpty());
+    }
+
+    /** Llena la tabla de reuniones: todo el periodo, o solo el día elegido en "Por día". */
+    private void showDetail() {
+        List<VideoSession> meetings = new ArrayList<>(dayFilter == null
+                ? periodSessions
+                : grouped.getOrDefault(dayFilter, List.of()));
+        meetings.sort(Comparator.comparing(VideoSession::recordedAt));
+        detailTable.getItems().setAll(meetings);
+        detailCount.setText(String.valueOf(meetings.size()));
+
+        boolean showingMeetings = meetingsTab.isSelected();
+        if (!showingMeetings) {
+            detailTitle.setText("Doble clic en un día para ver sus reuniones");
+        } else if (dayFilter != null) {
+            detailTitle.setText("Solo el " + dayFilter.format(MEDIUM));
+        } else {
+            detailTitle.setText(mode == Mode.DAY ? "Todas las del día" : "Todas las del periodo");
+        }
+        boolean filtered = showingMeetings && dayFilter != null;
+        clearFilter.setVisible(filtered);
+        clearFilter.setManaged(filtered);
     }
 }

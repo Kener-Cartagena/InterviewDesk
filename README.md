@@ -19,4 +19,5 @@ La base de datos queda en `~/InterviewDesk/desk.db` (carpeta de usuario).
 Las rutas se cambian en la pestaña Ajustes.
 
 ## Regla de horas
-Se cambia solo en `src/main/java/desk/model/Billing.java`.
+Se cuenta el tiempo exacto de cada reunión, sin redondeos, a una tarifa fija por hora ($15).
+La tarifa y la regla se cambian solo en `src/main/java/desk/model/Billing.java`.

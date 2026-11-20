@@ -16,7 +16,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeParseException;
 import java.util.Optional;
 
-/** Editar fecha, duración y horas pagadas de una reunión. */
+/** Editar fecha, hora y duración de una reunión. */
 final class SessionDialog {
     private SessionDialog() {}
 
@@ -33,8 +33,9 @@ final class SessionDialog {
         int originalMinutes = s.durationSeconds() / 60;
         Spinner<Integer> minutes = new Spinner<>(0, 1000, originalMinutes, 1);
         minutes.setEditable(true);
-        TextField paid = new TextField(s.billedOverride() == null ? "" : String.valueOf(s.billedOverride()));
-        paid.setPromptText("Automático: " + Fmt.hours(desk.model.Billing.hours(s.durationSeconds())));
+        Label exact = new Label("Tiempo exacto: " + Fmt.duration(s.durationSeconds())
+                + "  ·  " + Fmt.money(s.durationSeconds()));
+        exact.getStyleClass().add("muted");
         Label error = new Label();
         error.getStyleClass().add("error");
 
@@ -45,22 +46,18 @@ final class SessionDialog {
         grid.addRow(0, new Label("Fecha"), date);
         grid.addRow(1, new Label("Hora (HH:mm)"), time);
         grid.addRow(2, new Label("Duración (min)"), minutes);
-        grid.addRow(3, new Label("Horas pagadas"), paid);
+        grid.add(exact, 1, 3);
         grid.add(error, 0, 4, 2, 1);
         dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getStyleClass().add("desk-dialog");
 
         dialog.getDialogPane().lookupButton(ButtonType.OK).addEventFilter(javafx.event.ActionEvent.ACTION, ev -> {
             try {
                 minutes.increment(0); // confirma lo escrito a mano en el spinner
                 LocalTime.parse(time.getText().trim());
                 if (date.getValue() == null) throw new IllegalArgumentException("Elige una fecha.");
-                String raw = paid.getText().trim().replace(',', '.');
-                if (!raw.isEmpty()) Double.parseDouble(raw);
             } catch (DateTimeParseException e) {
                 error.setText("La hora debe tener formato HH:mm, por ejemplo 14:30.");
-                ev.consume();
-            } catch (NumberFormatException e) {
-                error.setText("Horas pagadas debe ser un número, por ejemplo 1 o 0.5.");
                 ev.consume();
             } catch (IllegalArgumentException e) {
                 error.setText(e.getMessage());
@@ -74,9 +71,7 @@ final class SessionDialog {
         LocalDateTime when = LocalDateTime.of(date.getValue(), LocalTime.parse(time.getText().trim()));
         // Si no tocaste los minutos, se conservan los segundos exactos leídos del video.
         int seconds = minutes.getValue() == originalMinutes ? s.durationSeconds() : minutes.getValue() * 60;
-        String raw = paid.getText().trim().replace(',', '.');
-        Double override = raw.isEmpty() ? null : Double.parseDouble(raw);
-        repo.updateSession(s.id(), when, seconds, override);
+        repo.updateSession(s.id(), when, seconds, s.billedOverride());
         return true;
     }
 }
